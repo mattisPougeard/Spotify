@@ -1,0 +1,128 @@
+body {
+    margin: 0;
+    font-family: 'Inter', sans-serif;
+    background: linear-gradient(135deg, #121212, #181818);
+    color: #fff;
+  }
+  
+  header {
+    padding: 1rem 2rem;
+    font-weight: 700;
+    font-size: 2rem;
+    letter-spacing: 1px;
+    background-color: #121212;
+    border-bottom: 1px solid #222;
+  }
+  
+  .grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr); /* 5 colonnes fixes */
+  gap: 1rem;
+  padding: 2rem;
+}
+  
+  .card {
+    position: relative;
+    cursor: pointer;
+    border-radius: 12px;
+    overflow: hidden;
+    transition: transform 0.3s, box-shadow 0.3s;
+    aspect-ratio: 1 / 1; /* carré parfait */
+  }
+  
+  .card:hover {
+    transform: scale(1.05);
+    box-shadow: 0 10px 20px rgba(0,255,150,0.3);
+  }
+  
+  .card img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  
+  .card .overlay {
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+    background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+    color: #fff;
+    padding: 0.5rem;
+  }
+  
+  .card .title {
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  
+  .card .artist {
+    font-size: 0.75rem;
+    color: #b3b3b3;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+  
+  /* glow animation pour la carte en lecture */
+  .card.playing {
+    box-shadow: 0 0 20px #1DB954;
+    animation: glow 1.5s infinite alternate;
+  }
+  
+  @keyframes glow {
+    from { box-shadow: 0 0 10px #1DB954; }
+    to { box-shadow: 0 0 25px #1DB954; }
+  }
+  
+  /* Mini-player */
+  .player {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    background: #181818;
+    padding: 0.5rem 1rem;
+    border-radius: 50px;
+    box-shadow: 0 5px 20px rgba(0,0,0,0.5);
+    width: 500px;
+    z-index: 1000;
+  }
+  
+  .player img {
+    width: 60px;
+    height: 60px;
+    object-fit: cover;
+    border-radius: 6px;
+    margin-right: 1rem;
+  }
+  
+  .player-info {
+    flex: 1;
+    overflow: hidden;
+  }
+  
+  .player-title {
+    font-weight: 600;
+    font-size: 1rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  
+  .player-artist {
+    font-size: 0.8rem;
+    color: #b3b3b3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  
+  /* Barre audio personnalisée */
+  audio {
+    width: 150px;
+    margin-left: 1rem;
+  }
+  

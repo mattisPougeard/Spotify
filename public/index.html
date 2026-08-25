@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Radar des Sorties - Preview</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Radar des Sorties</h1>
+    <button id="generate-playlists">Generate Smart Playlists</button>
+    <div id="loader" style="display:none;">⏳ Génération en cours…</div>
+    <div id="result"></div>
+  </header>
+
+  <main>
+    <div id="grid" class="grid"></div>
+  </main>
+
+  <div id="player" class="player">
+  <img id="player-cover" src="" alt="cover"/>
+  <div class="player-info">
+    <div id="player-title" class="player-title"></div>
+    <div id="player-artist" class="player-artist"></div>
+  </div>
+  <div class="audio-container">
+    <audio id="audio" controls></audio>
+  </div>
+</div>
+
+  <script src="app.js"></script>
+</body>
+</html>
