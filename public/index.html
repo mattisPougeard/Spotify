@@ -1,18 +1,24 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Radar des Sorties - Preview</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Radar des Sorties - Preview</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
-    <h1>Radar des Sorties</h1>
-    <button id="generate-playlists">Generate Smart Playlists</button>
-    <div id="loader" style="display:none;">⏳ Génération en cours…</div>
-    <div id="result"></div>
+    <div class="header-top">
+      <h1>Radar des Sorties</h1>
+      <div class="header-actions">
+        <span id="auth-status" class="auth-status">Vérification…</span>
+        <a class="btn btn-secondary" href="/login">Connexion Spotify</a>
+        <button id="generate-playlists" class="btn" type="button" disabled>Generate Smart Playlists</button>
+      </div>
+    </div>
+    <div id="loader" class="loader" hidden>Génération en cours…</div>
+    <div id="result" class="result"></div>
   </header>
 
   <main>
@@ -20,15 +26,15 @@
   </main>
 
   <div id="player" class="player">
-  <img id="player-cover" src="" alt="cover"/>
-  <div class="player-info">
-    <div id="player-title" class="player-title"></div>
-    <div id="player-artist" class="player-artist"></div>
+    <img id="player-cover" src="" alt="cover" />
+    <div class="player-info">
+      <div id="player-title" class="player-title"></div>
+      <div id="player-artist" class="player-artist"></div>
+    </div>
+    <div class="audio-container">
+      <audio id="audio" controls></audio>
+    </div>
   </div>
-  <div class="audio-container">
-    <audio id="audio" controls></audio>
-  </div>
-</div>
 
   <script src="app.js"></script>
 </body>

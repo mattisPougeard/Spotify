@@ -1,0 +1,5 @@
+node_modules/
+.env
+.bash_history
+.node_repl_history
+.DS_Store
