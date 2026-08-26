@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 
@@ -10,22 +11,40 @@ const app = express();
 app.use(cors());
 app.use(express.static("public"));
 
-app.use(session({
-  secret: "spotify-secret",
-  resave: false,
-  saveUninitialized: false
-}));
-
 const {
   SPOTIFY_CLIENT_ID,
   SPOTIFY_CLIENT_SECRET,
   SPOTIFY_REDIRECT_URI,
   PLAYLIST_ID,
-  PORT
+  PORT = 3000,
+  SESSION_SECRET,
+  NODE_ENV
 } = process.env;
 
-let accessToken = null;
-let refreshToken = null;
+for (const [name, value] of Object.entries({
+  SPOTIFY_CLIENT_ID,
+  SPOTIFY_CLIENT_SECRET,
+  SPOTIFY_REDIRECT_URI,
+  PLAYLIST_ID
+})) {
+  if (!value) console.warn(`⚠️  Missing env var ${name} — check your .env file.`);
+}
+
+if (!SESSION_SECRET) {
+  console.warn("⚠️  SESSION_SECRET not set — using a random value for this run only (sessions won't survive a restart). Set SESSION_SECRET in .env for production.");
+}
+
+app.use(session({
+  secret: SESSION_SECRET || crypto.randomBytes(32).toString("hex"),
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    httpOnly: true,
+    secure: NODE_ENV === "production",
+    sameSite: "lax"
+  }
+}));
 
 // --- Smart Playlist Generation ---
 const GENRE_MAP = {
@@ -69,74 +88,36 @@ const GENRE_MAP = {
   ]
 };
 
-// Helper pour mapper un genre → catégorie
 function mapGenreToCategory(genre) {
   for (const [cat, genres] of Object.entries(GENRE_MAP)) {
     if (genres.includes(genre.toLowerCase())) return cat;
   }
-  // fallback
   return "Experimental";
 }
 
-// --- Login / OAuth ---
-app.get("/login", (req, res) => {
-  const scope = "user-library-read playlist-modify-public playlist-modify-private";
-  const url =
-    "https://accounts.spotify.com/authorize" +
-    "?client_id=" + SPOTIFY_CLIENT_ID +
-    "&response_type=code" +
-    "&redirect_uri=" + SPOTIFY_REDIRECT_URI + // <-- ici exactement comme Dashboard
-    "&scope=" + scope;
-  res.redirect(url);
-});
+// --- Spotify auth helpers -------------------------------------------------
 
-// --- Callback Spotify ---
-app.get("/callback", async (req, res) => {
-  const code = req.query.code || null;
-  if (!code) return res.send("No code provided");
-
-  try {
-    const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        Authorization:
-          "Basic " +
-          Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString(
-            "base64"
-          ),
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: qs.stringify({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: SPOTIFY_REDIRECT_URI
-      })
-    });
-
-    const data = await tokenRes.json();
-    accessToken = data.access_token;
-    refreshToken = data.refresh_token;
-    req.session.access_token = data.access_token;
-
-    res.redirect("/"); // redirection vers frontend
-  } catch (err) {
-    console.error(err);
-    res.send("Erreur lors de l'échange du code");
-  }
-});
-
-// --- Refresh token automatique ---
-async function refreshAccessToken() {
-  if (!refreshToken) return;
-
+async function exchangeCodeForToken(code) {
   const res = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: {
-      Authorization:
-        "Basic " +
-        Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString(
-          "base64"
-        ),
+      Authorization: "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64"),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: qs.stringify({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: SPOTIFY_REDIRECT_URI
+    })
+  });
+  return res.json();
+}
+
+async function refreshAccessToken(refreshToken) {
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64"),
       "Content-Type": "application/x-www-form-urlencoded"
     },
     body: qs.stringify({
@@ -144,184 +125,192 @@ async function refreshAccessToken() {
       refresh_token: refreshToken
     })
   });
-
-  const data = await res.json();
-  accessToken = data.access_token;
+  return res.json();
 }
 
-app.get("/scan-genres", async (req, res) => {
-  try {
-    const accessToken = req.session.access_token;
-    console.log("SESSION:", req.session);
+/** Requires a session-authenticated user; 401s otherwise. */
+function requireAuth(req, res, next) {
+  if (!req.session.access_token) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+  next();
+}
 
-    if (!accessToken) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
-
-    let allTracks = [];
-    let offset = 0;
-    const limit = 50;
-
-    // 1️⃣ Récupération complète des liked tracks (pagination)
-    while (true) {
-      const response = await fetch(
-        `https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`
-          }
-        }
-      );
-
-      const data = await response.json();
-      allTracks = allTracks.concat(data.items);
-
-      if (data.items.length < limit) break;
-      offset += limit;
-    }
-
-    // 2️⃣ Récupération des artistes uniques
-    const artistIds = new Set();
-
-    allTracks.forEach(item => {
-      item.track.artists.forEach(artist => {
-        artistIds.add(artist.id);
-      });
+/**
+ * Calls the Spotify Web API with the session's access token, transparently
+ * refreshing it once and retrying on a 401.
+ */
+async function spotifyFetch(req, url, options = {}) {
+  const doFetch = (token) =>
+    fetch(url, {
+      ...options,
+      headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` }
     });
 
+  let response = await doFetch(req.session.access_token);
+
+  if (response.status === 401 && req.session.refresh_token) {
+    const refreshed = await refreshAccessToken(req.session.refresh_token);
+    if (refreshed.access_token) {
+      req.session.access_token = refreshed.access_token;
+      response = await doFetch(req.session.access_token);
+    }
+  }
+
+  return response;
+}
+
+async function fetchAllLikedTracks(req) {
+  let allTracks = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const response = await spotifyFetch(req, `https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`);
+    if (!response.ok) throw new Error(`Spotify API error (tracks): ${response.status}`);
+    const data = await response.json();
+    if (!data.items) break;
+
+    allTracks = allTracks.concat(data.items);
+    if (data.items.length < limit) break;
+    offset += limit;
+  }
+
+  return allTracks;
+}
+
+async function fetchArtistGenres(req, artistIds) {
+  const batches = [];
+  for (let i = 0; i < artistIds.length; i += 50) {
+    batches.push(artistIds.slice(i, i + 50));
+  }
+
+  const artistGenresMap = {};
+  // Small batches (max ~50 artists each) fetched in parallel — well within
+  // Spotify's rate limits for a handful of batches, and much faster than
+  // the previous sequential loop with an artificial delay.
+  await Promise.all(batches.map(async (batch) => {
+    const r = await spotifyFetch(req, `https://api.spotify.com/v1/artists?ids=${batch.join(",")}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    (d.artists || []).forEach(a => {
+      if (a) artistGenresMap[a.id] = a.genres || [];
+    });
+  }));
+
+  return artistGenresMap;
+}
+
+// --- Login / OAuth ---
+app.get("/login", (req, res) => {
+  const scope = "user-library-read playlist-modify-public playlist-modify-private";
+  const params = qs.stringify({
+    client_id: SPOTIFY_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: SPOTIFY_REDIRECT_URI,
+    scope
+  });
+  res.redirect(`https://accounts.spotify.com/authorize?${params}`);
+});
+
+app.get("/logout", (req, res) => {
+  req.session.destroy(() => res.redirect("/"));
+});
+
+// --- Callback Spotify ---
+app.get("/callback", async (req, res) => {
+  const code = req.query.code || null;
+  const authError = req.query.error || null;
+
+  if (authError) return res.redirect(`/?error=${encodeURIComponent(authError)}`);
+  if (!code) return res.redirect("/?error=missing_code");
+
+  try {
+    const data = await exchangeCodeForToken(code);
+    if (!data.access_token) {
+      console.error("Token exchange failed:", data);
+      return res.redirect("/?error=token_exchange_failed");
+    }
+
+    req.session.access_token = data.access_token;
+    req.session.refresh_token = data.refresh_token;
+
+    res.redirect("/");
+  } catch (err) {
+    console.error("Callback error:", err);
+    res.redirect("/?error=callback_failed");
+  }
+});
+
+app.get("/scan-genres", requireAuth, async (req, res) => {
+  try {
+    const allTracks = await fetchAllLikedTracks(req);
+
+    const artistIds = new Set();
+    allTracks.forEach(item => item.track?.artists.forEach(artist => artistIds.add(artist.id)));
     const uniqueArtistIds = Array.from(artistIds);
 
-    // 3️⃣ Récupération des genres par batch de 50 artistes
-    let allGenres = new Set();
-
-    for (let i = 0; i < uniqueArtistIds.length; i += 50) {
-      const batch = uniqueArtistIds.slice(i, i + 50).join(",");
-
-      const response = await fetch(
-        `https://api.spotify.com/v1/artists?ids=${batch}`,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`
-          }
-        }
-      );
-
-      const data = await response.json();
-
-      data.artists.forEach(artist => {
-        artist.genres.forEach(genre => {
-          allGenres.add(genre);
-        });
-      });
-    }
+    const artistGenresMap = await fetchArtistGenres(req, uniqueArtistIds);
+    const allGenres = new Set();
+    Object.values(artistGenresMap).forEach(genres => genres.forEach(g => allGenres.add(g)));
 
     res.json({
       totalTracks: allTracks.length,
       totalArtists: uniqueArtistIds.length,
       genres: Array.from(allGenres).sort()
     });
-
   } catch (err) {
     console.error("SCAN GENRES ERROR:", err);
-    res.status(500).json({ 
-      error: "Error scanning genres",
-      details: err.message 
-    });
+    res.status(500).json({ error: "Error scanning genres", details: err.message });
   }
-  
 });
 
 // --- Generate Smart Playlists ---
-app.get("/generate-smart-playlists", async (req, res) => {
+app.get("/generate-smart-playlists", requireAuth, async (req, res) => {
   try {
-    const accessToken = req.session.access_token;
-    if (!accessToken) return res.status(401).json({ error: "Not authenticated" });
+    // 1️⃣ Liked tracks
+    const allTracks = await fetchAllLikedTracks(req);
 
-    // 1️⃣ Récupère tous les liked tracks
-    let allTracks = [];
-    let offset = 0;
-    const limit = 50;
-
-    while (true) {
-      const response = await fetch(`https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        return res.status(response.status).json({ error: "Spotify API error (tracks)", details: errText });
-      }
-
-      const data = await response.json();
-      if (!data.items) break;
-
-      allTracks = allTracks.concat(data.items);
-      if (data.items.length < limit) break;
-      offset += limit;
-    }
-
-    // 2️⃣ Récupère tous les artistes uniques
+    // 2️⃣ Unique artists → genres
     const artistIds = new Set();
-    allTracks.forEach(item => item.track.artists.forEach(a => artistIds.add(a.id)));
-    const uniqueArtistIds = Array.from(artistIds);
+    allTracks.forEach(item => item.track?.artists.forEach(a => artistIds.add(a.id)));
+    const artistGenresMap = await fetchArtistGenres(req, Array.from(artistIds));
 
-    // 3️⃣ Récupère les genres des artistes par batch
-    const artistGenresMap = {}; // artistId → genres
-    for (let i = 0; i < uniqueArtistIds.length; i += 50) {
-      const batch = uniqueArtistIds.slice(i, i + 50).join(",");
-      const r = await fetch(`https://api.spotify.com/v1/artists?ids=${batch}`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      const d = await r.json();
-      d.artists.forEach(a => { artistGenresMap[a.id] = a.genres || []; });
-      await new Promise(r => setTimeout(r, 150));
-    }
-
-    // 4️⃣ Mappe chaque track → catégorie principale
-    const categorizedTracks = {}; // category → track ids
+    // 3️⃣ Track → category
+    const categorizedTracks = {};
     for (const cat of Object.keys(GENRE_MAP)) categorizedTracks[cat] = [];
 
     allTracks.forEach(item => {
       const track = item.track;
-      let trackCategories = new Set();
+      if (!track) return;
+      const trackCategories = new Set();
       track.artists.forEach(artist => {
-        const genres = artistGenresMap[artist.id] || [];
-        genres.forEach(g => trackCategories.add(mapGenreToCategory(g)));
+        (artistGenresMap[artist.id] || []).forEach(g => trackCategories.add(mapGenreToCategory(g)));
       });
-      // Si aucun genre → Experimental
       if (trackCategories.size === 0) trackCategories.add("Experimental");
-
-      // Ajoute track à toutes les catégories correspondantes
       trackCategories.forEach(cat => categorizedTracks[cat].push(track.uri));
     });
 
-    // 5️⃣ Crée / met à jour les playlists
-    const meResp = await fetch("https://api.spotify.com/v1/me", {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    // 4️⃣ Current user + existing playlists (fetched once, not per category)
+    const meResp = await spotifyFetch(req, "https://api.spotify.com/v1/me");
     const meData = await meResp.json();
     const userId = meData.id;
 
-    const results = {};
+    const playlistsResp = await spotifyFetch(req, "https://api.spotify.com/v1/me/playlists?limit=50");
+    const playlistsData = await playlistsResp.json();
+    const existingPlaylists = playlistsData.items || [];
 
-    for (const [cat, trackUris] of Object.entries(categorizedTracks)) {
-      if (trackUris.length === 0) continue;
+    // 5️⃣ Create any missing playlists first (sequential: avoids creating
+    //    two "Liked - X" playlists if categories were processed concurrently).
+    const nonEmptyCategories = Object.entries(categorizedTracks).filter(([, uris]) => uris.length > 0);
+    const playlistByCategory = {};
 
-      // 5a️⃣ Vérifie si playlist existe déjà
-      const playlistsResp = await fetch(`https://api.spotify.com/v1/me/playlists?limit=50`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      const playlistsData = await playlistsResp.json();
-      let playlist = playlistsData.items.find(p => p.name === `Liked - ${cat}`);
-
-      // 5b️⃣ Crée si n'existe pas
+    for (const [cat] of nonEmptyCategories) {
+      let playlist = existingPlaylists.find(p => p.name === `Liked - ${cat}`);
       if (!playlist) {
-        const createResp = await fetch(`https://api.spotify.com/v1/users/${userId}/playlists`, {
+        const createResp = await spotifyFetch(req, `https://api.spotify.com/v1/users/${userId}/playlists`, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: `Liked - ${cat}`,
             public: false,
@@ -329,37 +318,56 @@ app.get("/generate-smart-playlists", async (req, res) => {
           })
         });
         playlist = await createResp.json();
+        existingPlaylists.push(playlist);
+      }
+      playlistByCategory[cat] = playlist;
+    }
+
+    // 6️⃣ Clear + repopulate each playlist. Independent playlists, so this
+    //    runs in parallel instead of one category waiting on the previous.
+    async function clearPlaylist(playlistId) {
+      let uris = [];
+      let offset = 0;
+      while (true) {
+        const r = await spotifyFetch(req, `https://api.spotify.com/v1/playlists/${playlistId}/tracks?fields=items(track(uri)),next&limit=100&offset=${offset}`);
+        if (!r.ok) break;
+        const d = await r.json();
+        const items = d.items || [];
+        uris = uris.concat(items.map(t => t.track?.uri).filter(Boolean));
+        if (!d.next) break;
+        offset += 100;
       }
 
-      // 5c️⃣ Vide la playlist existante
-      const tracksInPlaylistResp = await fetch(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      const tracksInPlaylistData = await tracksInPlaylistResp.json();
-      const urisToRemove = tracksInPlaylistData.items.map(t => t.track.uri);
-      if (urisToRemove.length > 0) {
-        await fetch(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
+      for (let i = 0; i < uris.length; i += 100) {
+        const batch = uris.slice(i, i + 100);
+        await spotifyFetch(req, `https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
           method: "DELETE",
-          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ tracks: urisToRemove.map(u => ({ uri: u })) })
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tracks: batch.map(u => ({ uri: u })) })
         });
       }
+    }
 
-      // 5d️⃣ Ajoute les tracks par batch de 100
+    async function fillPlaylist(playlistId, trackUris) {
       for (let i = 0; i < trackUris.length; i += 100) {
         const batch = trackUris.slice(i, i + 100);
-        await fetch(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
+        await spotifyFetch(req, `https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
           method: "POST",
-          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ uris: batch })
         });
       }
-
-      results[cat] = trackUris.length;
     }
 
-    res.json({ status: "ok", playlists: results });
+    const results = {};
+    await Promise.all(nonEmptyCategories.map(async ([cat, trackUris]) => {
+      const playlist = playlistByCategory[cat];
+      await clearPlaylist(playlist.id);
+      await fillPlaylist(playlist.id, trackUris);
+      results[cat] = trackUris.length;
+    }));
 
+    res.json({ status: "ok", playlists: results });
   } catch (err) {
     console.error("Smart Playlist Error:", err);
     res.status(500).json({ error: "Smart Playlist Error", details: err.message });
@@ -367,57 +375,71 @@ app.get("/generate-smart-playlists", async (req, res) => {
 });
 
 // --- Playlist Spotify ---
-app.get("/playlist", async (req, res) => {
-  if (!accessToken) return res.status(401).json({ error: "Not logged in" });
-
+app.get("/playlist", requireAuth, async (req, res) => {
   try {
-    const response = await fetch(
-      `https://api.spotify.com/v1/playlists/${PLAYLIST_ID}/tracks`,
-      {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      }
-    );
-
+    const response = await spotifyFetch(req, `https://api.spotify.com/v1/playlists/${PLAYLIST_ID}/tracks`);
     const data = await response.json();
-    console.log("Data Spotify /playlist :", data); // <-- log ici
 
-    if (data.error && data.error.status === 401) {
-      await refreshAccessToken();
-      return res.redirect("/playlist");
+    if (!response.ok) {
+      return res.status(response.status).json(data);
     }
 
     res.json(data);
   } catch (err) {
-    console.error(err);
+    console.error("Playlist error:", err);
     res.status(500).json({ error: "Spotify API error" });
   }
 });
 
-// --- Deezer preview ---
+// --- Deezer preview (with a tiny in-memory cache to avoid refetching
+//     the same title/artist pair repeatedly) ---
+const deezerCache = new Map();
+const DEEZER_CACHE_MAX = 500;
+
 app.get("/deezer/preview", async (req, res) => {
   const { title, artist } = req.query;
 
-  if (!title || !artist)
+  if (!title || !artist) {
     return res.status(400).json({ error: "Missing title or artist" });
+  }
+
+  const cacheKey = `${title.toLowerCase()}::${artist.toLowerCase()}`;
+  if (deezerCache.has(cacheKey)) {
+    return res.json(deezerCache.get(cacheKey));
+  }
 
   try {
-    const response = await fetch(
-      `https://api.deezer.com/search?q=${encodeURIComponent(title + " " + artist)}`
-    );
+    const response = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(title + " " + artist)}`);
     const data = await response.json();
     const track = data.data?.find(t => t.preview);
 
     if (!track) return res.status(404).json({ error: "No preview found" });
 
-    res.json({
+    const payload = {
       title: track.title,
       artist: track.artist.name,
       preview: track.preview,
       cover: track.album.cover_medium
-    });
+    };
+
+    if (deezerCache.size >= DEEZER_CACHE_MAX) {
+      deezerCache.delete(deezerCache.keys().next().value);
+    }
+    deezerCache.set(cacheKey, payload);
+
+    res.json(payload);
   } catch (err) {
+    console.error("Deezer error:", err);
     res.status(500).json({ error: "Deezer error" });
   }
+});
+
+// --- 404 + error handling ---
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(PORT, () => {
